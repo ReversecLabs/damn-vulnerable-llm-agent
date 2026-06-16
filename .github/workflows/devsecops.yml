@@ -1,0 +1,195 @@
+name: DevSecOps Pipeline
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  # ============================================================
+  # STAGE 1: BUILD - Install and validate Python dependencies
+  # ============================================================
+  build:
+    name: Build & Prepare Environment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify Installation
+        run: python -c "import langchain; import streamlit; print('✓ Dependencies installed successfully')"
+
+  # ============================================================
+  # STAGE 2: SAST - Static Application Security Testing
+  # ============================================================
+  sast_semgrep:
+    name: SAST - Semgrep Code Scan
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep Scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          generateSarif: false
+          config: |
+            p/python
+            p/security-audit
+            p/owasp-top-ten
+
+  sast_sonarqube:
+    name: SAST - SonarQube Analysis & Quality Gate
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python for SonarQube
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@016cabf33a6b7edf0733e179a03ad408ad4e88ba
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=sunnycloudhust_llm-agent-devsecops
+            -Dsonar.organization=sunnycloudhust
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/*.md,**/tests/**,**/__pycache__/**,.github/**
+            -Dsonar.python.version=3.11
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.sarif.enabled=false
+
+  # ============================================================
+  # STAGE 3: SCA - Software Composition Analysis (CVE Check)
+  # ============================================================
+  sca_snyk:
+    name: SCA - Snyk Dependency Scan
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip freeze > requirements.txt
+
+      - name: Run Snyk Security Scan
+        uses: snyk/actions/python@8e119fbb6c251787721d34ba683ed48eba792766
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=requirements.txt --sarif-file-output=/dev/null
+
+  # ============================================================
+  # STAGE 4: DAST - Dynamic Application Security Testing
+  # (Note: Optional for CLI/backend apps without web interface)
+  # ============================================================
+  dast_owasp_zap:
+    name: DAST - OWASP ZAP Dynamic Scan
+    needs: [sast_semgrep, sast_sonarqube, sca_snyk]
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      security-events: write
+      
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start Streamlit Application
+        run: |
+          streamlit run main.py \
+            --server.port=8501 \
+            --server.address=127.0.0.1 \
+            --logger.level=debug > app.log 2>&1 &
+          
+          echo "Waiting for Streamlit to start on port 8501..."
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:8501 > /dev/null; then
+              echo "✓ Streamlit app is running"
+              break
+            fi
+            echo "  Attempt $i/30 - waiting..."
+            sleep 2
+          done
+          
+          if ! curl -s http://127.0.0.1:8501 > /dev/null; then
+            echo "✗ Failed to start Streamlit app"
+            cat app.log
+            exit 1
+          fi
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://127.0.0.1:8501'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+          fail_action: true
+          sarif_report_file: '/dev/null'
+
+  # ============================================================
+  # QUALITY GATE: Aggregate Results & Block Merge if Critical
+  # ============================================================
+  quality_gate:
+    name: Quality Gate - Security Check
+    needs: [sast_semgrep, sast_sonarqube, sca_snyk]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Check Pipeline Status
+        run: |
+          if [ "${{ needs.sast_semgrep.result }}" == "failure" ] || \
+             [ "${{ needs.sast_sonarqube.result }}" == "failure" ] || \
+             [ "${{ needs.sca_snyk.result }}" == "failure" ]; then
+            exit 1
+          fi
