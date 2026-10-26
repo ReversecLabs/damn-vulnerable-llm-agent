@@ -1,0 +1,24 @@
+name: SawOne-Agentic Security Scan
+on: workflow_dispatch
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Red-Team Target (demo LLM server)
+        run: |
+          python3 -m pip install -r examples/redteam-demo/requirements.txt
+          python3 examples/redteam-demo/app.py --port 8000 --mode vulnerable &
+          for i in {1..30}; do
+            if curl -s http://localhost:8000/health | grep -q '"healthy"'; then break; fi
+            sleep 1
+          done
+
+      - name: Run SawOne-Agentic
+        uses: hackin2minutes-oss/sawone-agentic-action@v1
+        with:
+          redteam-endpoint: 'http://localhost:8000/v1/chat/completions'
+          redteam-profile: 'quick'
+          enforce: false
